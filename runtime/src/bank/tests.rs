@@ -12456,6 +12456,94 @@ fn test_parent_block_id() {
 }
 
 #[test]
+fn test_alpenglow_blockhash_uses_block_id() {
+    // In Alpenglow mode (when parent_block_id is set), last_blockhash() should return
+    // the parent's block_id instead of using the blockhash queue
+    let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+    let parent_bank = Arc::new(Bank::new_for_tests(&genesis_config));
+    
+    // Set block_id on parent to simulate Alpenglow mode
+    let parent_block_id = Hash::new_unique();
+    parent_bank.set_block_id(Some(parent_block_id));
+    
+    // Create child bank
+    let child_bank = Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1);
+    
+    // In Alpenglow mode, last_blockhash should return the parent's block_id
+    assert_eq!(child_bank.last_blockhash(), parent_block_id);
+    
+    // Verify the parent_block_id is correctly set
+    assert_eq!(child_bank.parent_block_id(), Some(parent_block_id));
+    
+    // Verify last_blockhash_and_lamports_per_signature returns the parent's block_id
+    let (blockhash, _fee) = child_bank.last_blockhash_and_lamports_per_signature();
+    assert_eq!(blockhash, parent_block_id);
+    
+    // Verify is_blockhash_valid returns true for the parent's block_id
+    assert!(child_bank.is_blockhash_valid(&parent_block_id));
+    
+    // Verify get_blockhash_last_valid_block_height works with the parent's block_id
+    let last_valid_height = child_bank.get_blockhash_last_valid_block_height(&parent_block_id);
+    assert!(last_valid_height.is_some());
+}
+
+#[test]
+fn test_alpenglow_blockhash_validity_across_ancestors() {
+    // Test that block_id from ancestors within MAX_PROCESSING_AGE are valid
+    let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+    let mut banks = vec![Arc::new(Bank::new_for_tests(&genesis_config))];
+    
+    // Create a chain of banks with block_ids set
+    for i in 1..=5 {
+        let parent = banks.last().unwrap().clone();
+        let block_id = Hash::new_unique();
+        parent.set_block_id(Some(block_id));
+        
+        let child = Arc::new(Bank::new_from_parent(parent, &Pubkey::new_unique(), i));
+        banks.push(child);
+    }
+    
+    // Get the last bank
+    let current_bank = banks.last().unwrap();
+    
+    // The parent's block_id should be valid
+    let parent_block_id = current_bank.parent_block_id().unwrap();
+    assert!(current_bank.is_blockhash_valid(&parent_block_id));
+    
+    // Ancestors' block_ids should also be valid (within MAX_PROCESSING_AGE)
+    for i in 0..banks.len() - 1 {
+        if let Some(block_id) = banks[i].block_id() {
+            assert!(
+                current_bank.is_blockhash_valid(&block_id),
+                "block_id from ancestor {} should be valid", i
+            );
+        }
+    }
+}
+
+#[test]
+fn test_traditional_blockhash_when_no_block_id() {
+    // When parent_block_id is None (traditional mode), last_blockhash() should
+    // use the blockhash queue
+    let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+    let bank = Bank::new_for_tests(&genesis_config);
+    
+    // Register a blockhash in the queue
+    bank.register_unique_recent_blockhash_for_test();
+    
+    // Create a child bank without setting block_id
+    let child_bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::new_unique(), 1);
+    
+    // parent_block_id should be None since we didn't set it
+    assert_eq!(child_bank.parent_block_id(), None);
+    
+    // last_blockhash should still work using the blockhash queue
+    let child_blockhash = child_bank.last_blockhash();
+    // The child should have its own blockhash from the queue, which may differ from parent
+    assert!(child_blockhash != Hash::default());
+}
+
+#[test]
 fn test_get_top_epoch_stakes() {
     let num_of_nodes: u64 = 3000;
     let stakes = (1..num_of_nodes.checked_add(1).expect("Shouldn't be big")).collect::<Vec<_>>();

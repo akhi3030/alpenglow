@@ -2793,22 +2793,58 @@ impl Bank {
     }
 
     /// Return the last block hash registered.
+    /// In Alpenglow mode (when parent_block_id is available), returns the parent's block_id.
+    /// Otherwise, returns the last hash from the blockhash queue (traditional PoH mode).
     pub fn last_blockhash(&self) -> Hash {
-        self.blockhash_queue.read().unwrap().last_hash()
+        // In Alpenglow mode, use parent's block_id as the blockhash for transaction signing
+        if let Some(parent_block_id) = self.parent_block_id() {
+            parent_block_id
+        } else {
+            // Traditional mode: use the last hash from the blockhash queue
+            self.blockhash_queue.read().unwrap().last_hash()
+        }
     }
 
     pub fn last_blockhash_and_lamports_per_signature(&self) -> (Hash, u64) {
-        let blockhash_queue = self.blockhash_queue.read().unwrap();
-        let last_hash = blockhash_queue.last_hash();
-        let last_lamports_per_signature = blockhash_queue
-            .get_lamports_per_signature(&last_hash)
-            .unwrap(); // safe so long as the BlockhashQueue is consistent
-        (last_hash, last_lamports_per_signature)
+        // In Alpenglow mode, use parent's block_id as the blockhash
+        if let Some(parent_block_id) = self.parent_block_id() {
+            (parent_block_id, self.fee_rate_governor.lamports_per_signature)
+        } else {
+            // Traditional mode: use the last hash from the blockhash queue
+            let blockhash_queue = self.blockhash_queue.read().unwrap();
+            let last_hash = blockhash_queue.last_hash();
+            let last_lamports_per_signature = blockhash_queue
+                .get_lamports_per_signature(&last_hash)
+                .unwrap(); // safe so long as the BlockhashQueue is consistent
+            (last_hash, last_lamports_per_signature)
+        }
     }
 
     pub fn is_blockhash_valid(&self, hash: &Hash) -> bool {
-        let blockhash_queue = self.blockhash_queue.read().unwrap();
-        blockhash_queue.is_hash_valid_for_age(hash, MAX_PROCESSING_AGE)
+        // In Alpenglow mode, check if the hash matches the parent's block_id or ancestors' block_ids
+        if self.parent_block_id().is_some() {
+            // Check if the hash matches the parent's block_id
+            if Some(*hash) == self.parent_block_id() {
+                return true;
+            }
+            // Check if the hash matches any ancestor's block_id within MAX_PROCESSING_AGE
+            let mut current_bank = self.parent();
+            for _ in 0..MAX_PROCESSING_AGE {
+                if let Some(bank) = current_bank {
+                    if Some(*hash) == bank.block_id() {
+                        return true;
+                    }
+                    current_bank = bank.parent();
+                } else {
+                    break;
+                }
+            }
+            false
+        } else {
+            // Traditional mode: check the blockhash queue
+            let blockhash_queue = self.blockhash_queue.read().unwrap();
+            blockhash_queue.is_hash_valid_for_age(hash, MAX_PROCESSING_AGE)
+        }
     }
 
     pub fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> u64 {
@@ -2820,14 +2856,41 @@ impl Bank {
     }
 
     pub fn get_lamports_per_signature_for_blockhash(&self, hash: &Hash) -> Option<u64> {
-        let blockhash_queue = self.blockhash_queue.read().unwrap();
-        blockhash_queue.get_lamports_per_signature(hash)
+        // In Alpenglow mode, if the hash matches a block_id, return the current fee rate
+        if self.parent_block_id().is_some() {
+            // Check if the hash matches the parent's block_id or any ancestor's block_id
+            if Some(*hash) == self.parent_block_id() {
+                return Some(self.fee_rate_governor.lamports_per_signature);
+            }
+            let mut current_bank = self.parent();
+            for _ in 0..MAX_PROCESSING_AGE {
+                if let Some(bank) = current_bank {
+                    if Some(*hash) == bank.block_id() {
+                        return Some(bank.fee_rate_governor.lamports_per_signature);
+                    }
+                    current_bank = bank.parent();
+                } else {
+                    break;
+                }
+            }
+            None
+        } else {
+            // Traditional mode: use blockhash queue
+            let blockhash_queue = self.blockhash_queue.read().unwrap();
+            blockhash_queue.get_lamports_per_signature(hash)
+        }
     }
 
     pub fn get_fee_for_message(&self, message: &SanitizedMessage) -> Option<u64> {
         let lamports_per_signature = {
-            let blockhash_queue = self.blockhash_queue.read().unwrap();
-            blockhash_queue.get_lamports_per_signature(message.recent_blockhash())
+            // In Alpenglow mode, use block_id-based lookup
+            if self.parent_block_id().is_some() {
+                self.get_lamports_per_signature_for_blockhash(message.recent_blockhash())
+            } else {
+                // Traditional mode: use blockhash queue
+                let blockhash_queue = self.blockhash_queue.read().unwrap();
+                blockhash_queue.get_lamports_per_signature(message.recent_blockhash())
+            }
         }
         .or_else(|| {
             self.load_message_nonce_account(message).map(
@@ -2861,12 +2924,36 @@ impl Bank {
     }
 
     pub fn get_blockhash_last_valid_block_height(&self, blockhash: &Hash) -> Option<Slot> {
-        let blockhash_queue = self.blockhash_queue.read().unwrap();
-        // This calculation will need to be updated to consider epoch boundaries if BlockhashQueue
-        // length is made variable by epoch
-        blockhash_queue
-            .get_hash_age(blockhash)
-            .map(|age| self.block_height + MAX_PROCESSING_AGE as u64 - age)
+        // In Alpenglow mode, calculate based on block_id age
+        if self.parent_block_id().is_some() {
+            // Check if the hash matches the parent's block_id
+            if Some(*blockhash) == self.parent_block_id() {
+                return Some(self.block_height + MAX_PROCESSING_AGE as u64);
+            }
+            // Check if the hash matches any ancestor's block_id within MAX_PROCESSING_AGE
+            let mut current_bank = self.parent();
+            let mut age = 1u64;
+            for _ in 0..MAX_PROCESSING_AGE {
+                if let Some(bank) = current_bank {
+                    if Some(*blockhash) == bank.block_id() {
+                        return Some(self.block_height + MAX_PROCESSING_AGE as u64 - age);
+                    }
+                    current_bank = bank.parent();
+                    age += 1;
+                } else {
+                    break;
+                }
+            }
+            None
+        } else {
+            // Traditional mode: use blockhash queue
+            let blockhash_queue = self.blockhash_queue.read().unwrap();
+            // This calculation will need to be updated to consider epoch boundaries if BlockhashQueue
+            // length is made variable by epoch
+            blockhash_queue
+                .get_hash_age(blockhash)
+                .map(|age| self.block_height + MAX_PROCESSING_AGE as u64 - age)
+        }
     }
 
     /// If this is an alpenglow block, return the genesis certificate.
