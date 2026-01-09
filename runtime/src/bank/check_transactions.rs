@@ -81,12 +81,14 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<TransactionCheckResult> {
-        // In Alpenglow mode, we use block_id instead of the blockhash queue
-        let (last_blockhash, next_lamports_per_signature) = if self.parent_block_id().is_some() {
+        // Determine mode and get necessary values
+        let is_alpenglow_mode = self.parent_block_id().is_some();
+        let (last_blockhash, next_lamports_per_signature, hash_queue) = if is_alpenglow_mode {
             // Alpenglow mode: use last_blockhash() which returns parent's block_id
             (
                 self.last_blockhash(),
                 self.fee_rate_governor.lamports_per_signature,
+                None, // Don't acquire hash_queue lock in Alpenglow mode
             )
         } else {
             // Traditional mode: use the blockhash queue
@@ -94,10 +96,9 @@ impl Bank {
             let last_hash = hash_queue.last_hash();
             // safe so long as the BlockhashQueue is consistent
             let lamports = hash_queue.get_lamports_per_signature(&last_hash).unwrap();
-            (last_hash, lamports)
+            (last_hash, lamports, Some(hash_queue))
         };
 
-        let hash_queue = self.blockhash_queue.read().unwrap();
         let next_durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
 
         let feature_set: &FeatureSet = &self.feature_set;
@@ -142,7 +143,7 @@ impl Bank {
                         tx.borrow(),
                         max_age,
                         &next_durable_nonce,
-                        &hash_queue,
+                        hash_queue.as_deref(),
                         next_lamports_per_signature,
                         error_counters,
                         compute_budget_and_limits,
@@ -180,7 +181,7 @@ impl Bank {
         tx: &impl SVMMessage,
         max_age: usize,
         next_durable_nonce: &DurableNonce,
-        hash_queue: &BlockhashQueue,
+        hash_queue: Option<&BlockhashQueue>,
         next_lamports_per_signature: u64,
         error_counters: &mut TransactionErrorMetrics,
         compute_budget: Result<SVMTransactionExecutionAndFeeBudgetLimits, TransactionError>,
@@ -202,7 +203,7 @@ impl Bank {
         } else {
             // Traditional mode: use the blockhash queue
             hash_queue
-                .get_hash_info_if_valid(recent_blockhash, max_age)
+                .and_then(|queue| queue.get_hash_info_if_valid(recent_blockhash, max_age))
                 .map(|hash_info| hash_info.lamports_per_signature())
         };
         

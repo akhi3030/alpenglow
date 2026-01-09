@@ -2821,25 +2821,9 @@ impl Bank {
     }
 
     pub fn is_blockhash_valid(&self, hash: &Hash) -> bool {
-        // In Alpenglow mode, check if the hash matches the parent's block_id or ancestors' block_ids
+        // In Alpenglow mode, check if the hash matches a block_id in ancestors
         if self.parent_block_id().is_some() {
-            // Check if the hash matches the parent's block_id
-            if Some(*hash) == self.parent_block_id() {
-                return true;
-            }
-            // Check if the hash matches any ancestor's block_id within MAX_PROCESSING_AGE
-            let mut current_bank = self.parent();
-            for _ in 0..MAX_PROCESSING_AGE {
-                if let Some(bank) = current_bank {
-                    if Some(*hash) == bank.block_id() {
-                        return true;
-                    }
-                    current_bank = bank.parent();
-                } else {
-                    break;
-                }
-            }
-            false
+            self.find_block_id_in_ancestors(hash, MAX_PROCESSING_AGE).is_some()
         } else {
             // Traditional mode: check the blockhash queue
             let blockhash_queue = self.blockhash_queue.read().unwrap();
@@ -2856,24 +2840,24 @@ impl Bank {
     }
 
     pub fn get_lamports_per_signature_for_blockhash(&self, hash: &Hash) -> Option<u64> {
-        // In Alpenglow mode, if the hash matches a block_id, return the current fee rate
+        // In Alpenglow mode, if the hash matches a block_id, return the fee rate
         if self.parent_block_id().is_some() {
-            // Check if the hash matches the parent's block_id or any ancestor's block_id
-            if Some(*hash) == self.parent_block_id() {
-                return Some(self.fee_rate_governor.lamports_per_signature);
-            }
-            let mut current_bank = self.parent();
-            for _ in 0..MAX_PROCESSING_AGE {
-                if let Some(bank) = current_bank {
-                    if Some(*hash) == bank.block_id() {
-                        return Some(bank.fee_rate_governor.lamports_per_signature);
+            let age = self.find_block_id_in_ancestors(hash, MAX_PROCESSING_AGE)?;
+            if age == 0 {
+                // Parent's block_id - use current fee rate
+                Some(self.fee_rate_governor.lamports_per_signature)
+            } else {
+                // Ancestor's block_id - navigate to that bank and get its fee rate
+                let mut current_bank = self.parent();
+                for _ in 1..=age {
+                    if let Some(bank) = current_bank {
+                        current_bank = bank.parent();
+                    } else {
+                        return None;
                     }
-                    current_bank = bank.parent();
-                } else {
-                    break;
                 }
+                current_bank.map(|bank| bank.fee_rate_governor.lamports_per_signature)
             }
-            None
         } else {
             // Traditional mode: use blockhash queue
             let blockhash_queue = self.blockhash_queue.read().unwrap();
@@ -2926,25 +2910,8 @@ impl Bank {
     pub fn get_blockhash_last_valid_block_height(&self, blockhash: &Hash) -> Option<Slot> {
         // In Alpenglow mode, calculate based on block_id age
         if self.parent_block_id().is_some() {
-            // Check if the hash matches the parent's block_id
-            if Some(*blockhash) == self.parent_block_id() {
-                return Some(self.block_height + MAX_PROCESSING_AGE as u64);
-            }
-            // Check if the hash matches any ancestor's block_id within MAX_PROCESSING_AGE
-            let mut current_bank = self.parent();
-            let mut age = 1u64;
-            for _ in 0..MAX_PROCESSING_AGE {
-                if let Some(bank) = current_bank {
-                    if Some(*blockhash) == bank.block_id() {
-                        return Some(self.block_height + MAX_PROCESSING_AGE as u64 - age);
-                    }
-                    current_bank = bank.parent();
-                    age += 1;
-                } else {
-                    break;
-                }
-            }
-            None
+            let age = self.find_block_id_in_ancestors(blockhash, MAX_PROCESSING_AGE)?;
+            Some(self.block_height + MAX_PROCESSING_AGE as u64 - age)
         } else {
             // Traditional mode: use blockhash queue
             let blockhash_queue = self.blockhash_queue.read().unwrap();
@@ -5797,6 +5764,31 @@ impl Bank {
         } else {
             *block_id_w = block_id;
         }
+    }
+
+    /// Helper method to find a block_id in ancestors within max_age
+    /// Returns (block_id, age) if found, where age is 0 for parent, 1 for grandparent, etc.
+    fn find_block_id_in_ancestors(&self, target_block_id: &Hash, max_age: usize) -> Option<u64> {
+        // Check parent first
+        if self.parent_block_id().as_ref() == Some(target_block_id) {
+            return Some(0);
+        }
+        
+        // Check ancestors
+        let mut current_bank = self.parent();
+        let mut age = 1u64;
+        for _ in 0..max_age {
+            if let Some(bank) = current_bank {
+                if bank.block_id().as_ref() == Some(target_block_id) {
+                    return Some(age);
+                }
+                current_bank = bank.parent();
+                age += 1;
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     pub fn compute_budget(&self) -> Option<ComputeBudget> {
