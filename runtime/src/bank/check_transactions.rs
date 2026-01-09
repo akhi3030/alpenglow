@@ -81,13 +81,24 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<TransactionCheckResult> {
+        // In Alpenglow mode, we use block_id instead of the blockhash queue
+        let (last_blockhash, next_lamports_per_signature) = if self.parent_block_id().is_some() {
+            // Alpenglow mode: use last_blockhash() which returns parent's block_id
+            (
+                self.last_blockhash(),
+                self.fee_rate_governor.lamports_per_signature,
+            )
+        } else {
+            // Traditional mode: use the blockhash queue
+            let hash_queue = self.blockhash_queue.read().unwrap();
+            let last_hash = hash_queue.last_hash();
+            // safe so long as the BlockhashQueue is consistent
+            let lamports = hash_queue.get_lamports_per_signature(&last_hash).unwrap();
+            (last_hash, lamports)
+        };
+
         let hash_queue = self.blockhash_queue.read().unwrap();
-        let last_blockhash = hash_queue.last_hash();
         let next_durable_nonce = DurableNonce::from_blockhash(&last_blockhash);
-        // safe so long as the BlockhashQueue is consistent
-        let next_lamports_per_signature = hash_queue
-            .get_lamports_per_signature(&last_blockhash)
-            .unwrap();
 
         let feature_set: &FeatureSet = &self.feature_set;
         let fee_features = FeeFeatures::from(feature_set);
@@ -175,10 +186,30 @@ impl Bank {
         compute_budget: Result<SVMTransactionExecutionAndFeeBudgetLimits, TransactionError>,
     ) -> TransactionCheckResult {
         let recent_blockhash = tx.recent_blockhash();
-        if let Some(hash_info) = hash_queue.get_hash_info_if_valid(recent_blockhash, max_age) {
+        
+        // In Alpenglow mode, check if the blockhash is a valid block_id
+        let hash_info_result = if self.parent_block_id().is_some() {
+            // Check if the recent_blockhash matches a block_id
+            if self.is_blockhash_valid(recent_blockhash) {
+                // Get the lamports_per_signature for this block_id
+                let lamports_per_signature = self
+                    .get_lamports_per_signature_for_blockhash(recent_blockhash)
+                    .unwrap_or(next_lamports_per_signature);
+                Some(lamports_per_signature)
+            } else {
+                None
+            }
+        } else {
+            // Traditional mode: use the blockhash queue
+            hash_queue
+                .get_hash_info_if_valid(recent_blockhash, max_age)
+                .map(|hash_info| hash_info.lamports_per_signature())
+        };
+        
+        if let Some(lamports_per_signature) = hash_info_result {
             Ok(Self::checked_transactions_details_with_test_override(
                 None,
-                hash_info.lamports_per_signature(),
+                lamports_per_signature,
                 compute_budget,
             ))
         } else if let Some((nonce, previous_lamports_per_signature)) = self

@@ -12544,6 +12544,63 @@ fn test_traditional_blockhash_when_no_block_id() {
 }
 
 #[test]
+fn test_alpenglow_transaction_processing_with_block_id() {
+    // Test end-to-end transaction processing using block_id as blockhash in Alpenglow mode
+    let (genesis_config, mint_keypair) = create_genesis_config(10_000_000);  // Increase initial amount even more
+    let (parent_bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    
+    // Set block_id on parent to simulate Alpenglow mode
+    let parent_block_id = Hash::new_unique();
+    parent_bank.set_block_id(Some(parent_block_id));
+    
+    // Freeze parent bank and create child bank
+    goto_end_of_slot(Arc::clone(&parent_bank));
+    let child_bank = Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1);
+    
+    // Verify that last_blockhash returns the parent's block_id
+    let blockhash = child_bank.last_blockhash();
+    assert_eq!(blockhash, parent_block_id);
+    
+    // Create a transaction signed with the parent's block_id
+    let key1 = Keypair::new();
+    let amount = child_bank.get_minimum_balance_for_rent_exemption(0);  // Get rent-exempt amount
+    let tx = system_transaction::transfer(
+        &mint_keypair,
+        &key1.pubkey(),
+        amount,
+        parent_block_id, // Use parent's block_id as the blockhash
+    );
+    
+    // Process the transaction - it should succeed
+    let result = child_bank.process_transaction(&tx);
+    assert!(
+        result.is_ok(), 
+        "Transaction should process successfully with parent's block_id, got error: {:?}",
+        result.err()
+    );
+    
+    // Verify the transaction was recorded in the status cache
+    assert!(
+        child_bank.has_signature(tx.signatures.first().unwrap()),
+        "Transaction signature should be in status cache"
+    );
+    
+    // Verify blockhash validity checks work
+    assert!(
+        child_bank.is_blockhash_valid(&parent_block_id),
+        "Parent's block_id should be valid"
+    );
+    
+    // Verify fee lookup works
+    let fee = child_bank.get_lamports_per_signature_for_blockhash(&parent_block_id);
+    assert!(fee.is_some(), "Should be able to get fee for parent's block_id");
+    
+    // Verify last valid block height calculation
+    let last_valid_height = child_bank.get_blockhash_last_valid_block_height(&parent_block_id);
+    assert!(last_valid_height.is_some(), "Should be able to get last valid height for parent's block_id");
+}
+
+#[test]
 fn test_get_top_epoch_stakes() {
     let num_of_nodes: u64 = 3000;
     let stakes = (1..num_of_nodes.checked_add(1).expect("Shouldn't be big")).collect::<Vec<_>>();
